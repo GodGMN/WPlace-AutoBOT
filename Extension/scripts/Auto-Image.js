@@ -1043,6 +1043,8 @@ localStorage.removeItem("lp");
     lastPaintedPosition: { x: 0, y: 0 }, // Track last successfully painted coordinate
     estimatedTime: 0,
     language: 'en',
+    cachedWasmToken: null,
+    wasmTokenExpiry: 0,
     paintingSpeed: CONFIG.PAINTING_SPEED.DEFAULT, // pixels batch size
     batchMode: CONFIG.BATCH_MODE, // "normal" or "random"
     paintingOrder: CONFIG.PAINTING_ORDER, // "sequential" or "color-by-color"
@@ -9496,8 +9498,28 @@ localStorage.removeItem("lp");
         updateUI('missingRequirements', 'error');
         return;
       }
+
       await ensureToken();
-      if (!getTurnstileToken()) return;
+
+      let tokenWaitAttempts = 0;
+      const maxTokenWaitAttempts = 60;
+      while (tokenWaitAttempts < maxTokenWaitAttempts) {
+        if (isTokenValid() && !tokenManager.tokenGenerationInProgress) {
+          console.log('✅ Startup token is valid and ready');
+          break;
+        }
+        console.log(`⏳ Waiting for token to be ready... (${tokenWaitAttempts * 500}ms elapsed)`);
+        await Utils.sleep(500);
+        tokenWaitAttempts++;
+      }
+
+      if (!getTurnstileToken() || !isTokenValid()) {
+        console.error('❌ Failed to obtain valid token at startup');
+        updateUI('captchaFailed', 'error');
+        return;
+      }
+
+      console.log('🎯 Token validated successfully, starting painting process');
 
       // Only perform progressive pixel detection on first start of session
       if (!state.preFilteringDone) {
@@ -10931,19 +10953,34 @@ localStorage.removeItem("lp");
         console.log(`✅ Batch succeeded on attempt ${attempt}`);
         return true;
       } else if (result === 'token_error') {
-        console.log(`🔑 Token error on attempt ${attempt} - no token available during processing`);
-        console.log(`❌ Stopping batch processing - tokens must be generated at startup/start button only`);
+        console.log(`🔑 Token error on attempt ${attempt}`);
         updateUI('captchaFailed', 'error');
-        await Utils.sleep(2000); // Wait longer before retrying after token failure
-        continue; // Continue to retry until maxRetries reached
+        await Utils.sleep(2000);
+        continue;
       } else if (result === 'token_regenerated') {
-        console.log(`🔄 Token regenerated on attempt ${attempt} after 403 error - retrying batch`);
+        console.log(`🔄 Token regenerated on attempt ${attempt}`);
         const pausedX = state.lastPaintedPosition.x;
         const pausedY = state.lastPaintedPosition.y;
         updateUI('paintingPaused', 'warning', { x: pausedX, y: pausedY });
-        // Don't count token regeneration as a failed attempt, retry immediately
+
+        let waitAttempts = 0;
+        const maxWaitAttempts = 30;
+        while (waitAttempts < maxWaitAttempts) {
+          if (isTokenValid() && !tokenManager.tokenGenerationInProgress) {
+            console.log(`✅ Token ready after ${waitAttempts * 500}ms`);
+            break;
+          }
+          await Utils.sleep(500);
+          waitAttempts++;
+        }
+
+        if (!isTokenValid()) {
+          console.error('❌ Token still not valid after waiting');
+          return false;
+        }
+
         attempt--;
-        await Utils.sleep(500); // Brief pause before retry
+        console.log(`🔄 Retrying batch`);
         continue;
       } else if (result === 'token_regeneration_failed') {
         console.log(`❌ Token regeneration failed on attempt ${attempt} after 403 error`);
@@ -10984,6 +11021,12 @@ localStorage.removeItem("lp");
   }
 
   async function sendPixelBatch(pixelBatch, regionX, regionY) {
+    // Check if token is valid before attempting to use it
+    if (!isTokenValid()) {
+      console.warn('⚠️ Token expired or invalid - cannot send batch during processing');
+      return 'token_error';
+    }
+
     let token = getTurnstileToken();
 
     // Don't auto-generate tokens during processing - return error if no token available
@@ -11003,10 +11046,35 @@ localStorage.removeItem("lp");
 
     try {
       const payload = { coords, colors, t: token, fp: fpStr32 };
-      var wasmtoken = await createWasmToken(regionX, regionY, payload);
+
+      const now = Date.now();
+      const WASM_TOKEN_LIFETIME = 240000;
+      let wasmtoken;
+
+      if (state.cachedWasmToken && now < state.wasmTokenExpiry) {
+        console.log('♻️ Reusing cached WASM token');
+        wasmtoken = state.cachedWasmToken;
+      } else {
+        console.log('🔄 Generating new WASM token');
+        wasmtoken = await createWasmToken(regionX, regionY, payload);
+
+        if (!wasmtoken) {
+          console.error('❌ WASM token generation failed');
+          return false;
+        }
+
+        state.cachedWasmToken = wasmtoken;
+        state.wasmTokenExpiry = now + WASM_TOKEN_LIFETIME;
+        console.log(`✅ WASM token cached, expires in ${WASM_TOKEN_LIFETIME / 1000}s`);
+      }
+
       const res = await fetch(`https://backend.wplace.live/s0/pixel/${regionX}/${regionY}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=UTF-8', "x-pawtect-token": wasmtoken },
+        headers: {
+          'Content-Type': 'text/plain;charset=UTF-8',
+          'x-pawtect-token': wasmtoken,
+          'x-pawtect-variant': 'koala'
+        },
         credentials: 'include',
         body: JSON.stringify(payload),
       });
@@ -11016,20 +11084,19 @@ localStorage.removeItem("lp");
         try {
           data = await res.json();
         } catch (_) { }
-        console.error('❌ 403 Forbidden. Token invalid during painting - regeneration allowed.');
+        console.log('🔄 403 error - regenerating tokens');
 
-        // 403 errors during painting allow token regeneration per workflow requirements
-        console.log('� Token invalid (403) during painting - regenerating token as allowed by workflow');
         setTurnstileToken(null);
+        state.cachedWasmToken = null;
+        state.wasmTokenExpiry = 0;
         createTokenPromise();
 
-        // Attempt to regenerate token immediately
         const newToken = await ensureToken(true);
         if (newToken) {
-          console.log('✅ Token regenerated after 403 error, returning regenerate signal');
+          console.log('✅ Token regenerated, retrying');
           return 'token_regenerated';
         } else {
-          console.error('❌ Failed to regenerate token after 403 error');
+          console.error('❌ Token regeneration failed');
           return 'token_regeneration_failed';
         }
       }
@@ -11428,80 +11495,111 @@ localStorage.removeItem("lp");
   pawtect_chunk ??= await findTokenModule("pawtect_wasm_bg.wasm");
 
   async function createWasmToken(regionX, regionY, payload) {
-    try {
-      // Load the Pawtect module
-      // Fallback to D1pWKeJi.js if pawtect_chunk is undefined, ensuring stability
-      const chunkName = (typeof pawtect_chunk !== 'undefined' && pawtect_chunk) ? pawtect_chunk : "D1pWKeJi.js";
-      const mod = await import(new URL('/_app/immutable/chunks/' + chunkName, location.origin).href);
-      
-      // Check for API client (mod.a) instead of WASM init (mod._)
-      if (!mod.a) {
-        console.error('❌ API Client (mod.a) not found');
-        return null;
-      }
-      console.log('✅ Module loaded and API client found');
+    console.log('🔄 WASM module approach is broken - using network interception instead');
 
-      // Prepare data for paint() method
-      // We need to reconstruct the internal pixel object structure expected by mod.a.paint
-      console.log('📝 Reconstructing paint data from payload...');
-      const paintPixels = [];
-      for (let i = 0; i < payload.colors.length; i++) {
-        paintPixels.push({
-          tile: [regionX, regionY],
-          pixel: [payload.coords[i * 2], payload.coords[i * 2 + 1]],
-          season: mod.C, // Use exported season constant
-          colorIdx: payload.colors[i]
-        });
-      }
-
-      // Hook request method to capture token
-      // This bypasses the need to manually handle WASM memory or obfuscated context functions
-      console.log('🚀 Hooking API client to capture token...');
-      const originalRequest = mod.a.request.bind(mod.a);
+    return new Promise(async (resolve, reject) => {
       let capturedToken = null;
+      let requestIntercepted = false;
 
-      mod.a.request = async function(url, options) {
-        // Intercept the token from headers
-        if (options && options.headers && options.headers['x-pawtect-token']) {
-          capturedToken = options.headers['x-pawtect-token'];
-          console.log('✅ Token captured via hook');
-          
-          // Return fake success to satisfy paint() execution flow
-          return { status: 200, json: async () => ({}) };
+      // Intercept fetch requests
+      const originalFetch = window.fetch;
+      window.fetch = async function(...args) {
+        const url = args[0];
+        const options = args[1] || {};
+
+        // Check if this is a pixel paint request
+        if (typeof url === 'string' && url.includes('/s0/pixel/')) {
+          const headers = options.headers || {};
+          if (headers['x-pawtect-token']) {
+            console.log('✅ Captured x-pawtect-token from fetch request');
+            capturedToken = headers['x-pawtect-token'];
+            requestIntercepted = true;
+
+            // Restore original fetch
+            window.fetch = originalFetch;
+
+            // Let the request complete normally (don't cancel it)
+            // This prevents "Can't reach server" errors
+            resolve(capturedToken);
+
+            // Pass through the request normally
+            return originalFetch.apply(this, args);
+          }
         }
-        // Pass through other requests (like /me)
-        return originalRequest(url, options);
+
+        // Pass through other requests
+        return originalFetch.apply(this, args);
       };
 
-      // Trigger the paint function
-      console.log('🚀 Calling mod.a.paint() to generate token...');
       try {
-        // This handles UserID, URL, and WASM interaction internally
-        await mod.a.paint(paintPixels, payload.fp);
-      } catch (e) {
-        // Ignore errors caused by our fake request response
-      } finally {
-        // Restore original request method (Cleanup)
-        mod.a.request = originalRequest;
-        console.log('✅ Request hook restored');
-      }
+        console.log('🖱️ Simulating UI paint to generate WASM token...');
 
-      // Validate and return result
-      if (capturedToken) {
-        console.log('');
-        console.log('🎉 SUCCESS!');
-        console.log('🔑 Full token:');
-        console.log(capturedToken);
-        return capturedToken;
-      } else {
-        console.error('❌ Failed to capture token via hooking');
-        return null;
-      }
+        // Use the same UI automation as handleCaptchaFallback
+        // Click paint button
+        const mainPaintBtn = document.querySelector('button.btn.btn-primary.btn-lg, button.btn.btn-primary.sm\\:btn-xl');
+        if (!mainPaintBtn) {
+          throw new Error('Paint button not found');
+        }
+        mainPaintBtn.click();
+        await Utils.sleep(500);
 
-    } catch (error) {
-      console.error('❌ Failed to generate token:', error);
-      return null;
-    }
+        // Click first color (not transparent, use actual color from payload)
+        const firstColor = payload.colors[0] || 1;
+        const colorBtn = document.querySelector(`button#color-${firstColor}`);
+        if (colorBtn) {
+          colorBtn.click();
+          await Utils.sleep(300);
+        }
+
+        // Click canvas to place pixel
+        const canvas = document.querySelector('canvas');
+        if (canvas) {
+          const rect = canvas.getBoundingClientRect();
+          const x = rect.left + payload.coords[0];
+          const y = rect.top + payload.coords[1];
+
+          canvas.dispatchEvent(new MouseEvent('click', {
+            clientX: x,
+            clientY: y,
+            bubbles: true
+          }));
+          await Utils.sleep(300);
+        }
+
+        // Click confirm button - this triggers the request we're intercepting
+        const confirmBtn = document.querySelector('button.btn.btn-primary');
+        if (confirmBtn) {
+          confirmBtn.click();
+
+          // Wait for interception (max 10 seconds)
+          const startTime = Date.now();
+          while (!requestIntercepted && (Date.now() - startTime) < 10000) {
+            await Utils.sleep(100);
+          }
+
+          if (!requestIntercepted) {
+            throw new Error('Failed to intercept token within 10 seconds');
+          }
+
+          // Close the paint dialog by pressing Escape
+          await Utils.sleep(500);
+          document.dispatchEvent(new KeyboardEvent('keydown', {
+            key: 'Escape',
+            code: 'Escape',
+            bubbles: true
+          }));
+          console.log('✅ Paint dialog closed after token capture');
+
+        } else {
+          throw new Error('Confirm button not found');
+        }
+
+      } catch (error) {
+        console.error('❌ UI token generation failed:', error);
+        window.fetch = originalFetch; // Restore on error
+        resolve(null);
+      }
+    });
   }
 
   async function findTokenModule(str) {
